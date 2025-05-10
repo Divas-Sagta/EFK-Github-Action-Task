@@ -1,62 +1,66 @@
 name: Upload Commit Logs to S3
-
 on:
   push:
     branches: [ main ]
-
 permissions:
   id-token: write
   contents: read
-
 jobs:
   upload-commit-logs:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    - name: Generate commit logs
+      run: |
+        mkdir -p logs
+        REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        LOG_FILE="logs/${REPO_NAME}_commits_${TIMESTAMP}.json"
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.AWS_REGION }}
+        # Get latest commit info
+        COMMIT_SHA=${{ github.sha }}
+        AUTHOR_NAME=$(git log -1 --pretty=format:'%an' $COMMIT_SHA)
+        AUTHOR_EMAIL=$(git log -1 --pretty=format:'%ae' $COMMIT_SHA)
+        COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s' $COMMIT_SHA)
+        COMMIT_DATE=$(git log -1 --pretty=format:'%at' $COMMIT_SHA)
+        COMMIT_DATE_ISO=$(date -d @$COMMIT_DATE -u +"%Y-%m-%dT%H:%M:%SZ")
 
-      - name: Generate commit logs
-        run: |
-          mkdir -p logs
-          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
-          TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          LOG_FILE="logs/${REPO_NAME}_commits_${TIMESTAMP}.json"
-          
-          # Get latest commit info
-          COMMIT_SHA=${{ github.sha }}
-          AUTHOR_NAME=$(git log -1 --pretty=format:'%an' $COMMIT_SHA)
-          AUTHOR_EMAIL=$(git log -1 --pretty=format:'%ae' $COMMIT_SHA)
-          COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s' $COMMIT_SHA)
-          COMMIT_DATE=$(git log -1 --pretty=format:'%at' $COMMIT_SHA)
-          COMMIT_DATE_ISO=$(date -d @$COMMIT_DATE -u +"%Y-%m-%dT%H:%M:%SZ")
-          
-          # Generate structured log with additional metadata
-          cat > $LOG_FILE << EOF
-          {
-            "repository": "$GITHUB_REPOSITORY",
-            "branch": "${GITHUB_REF#refs/heads/}",
-            "commit_sha": "$COMMIT_SHA",
-            "author_name": "$AUTHOR_NAME",
-            "author_email": "$AUTHOR_EMAIL",
-            "commit_message": $(echo "$COMMIT_MESSAGE" | jq -R .),
-            "commit_date": "$COMMIT_DATE_ISO",
-            "workflow_run_id": "$GITHUB_RUN_ID",
-            "pushed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          }
-          EOF
-          
-          echo "Created log file: $LOG_FILE"
-          cat $LOG_FILE
+        # Get previous commit SHA
+        PREVIOUS_COMMIT=$(git rev-parse $COMMIT_SHA^)
 
-      - name: Upload to S3
-        run: |
-          aws s3 cp logs/ s3://${{ secrets.S3_BUCKET_NAME }}/github-logs/ --recursive
+        # Get the list of changed files
+        CHANGED_FILES=$(git diff --name-status $PREVIOUS_COMMIT $COMMIT_SHA | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {status: .[0], file: .[1]}) | .')
+
+        # Get the actual diff for each file (limited to protect against large diffs)
+        DIFFS=$(git diff --unified=3 $PREVIOUS_COMMIT $COMMIT_SHA | head -n 10000)
+
+        # Generate structured log with additional metadata
+        cat > $LOG_FILE << EOF
+        {
+          "repository": "$GITHUB_REPOSITORY",
+          "branch": "${GITHUB_REF#refs/heads/}",
+          "commit_sha": "$COMMIT_SHA",
+          "author_name": "$AUTHOR_NAME",
+          "author_email": "$AUTHOR_EMAIL",
+          "commit_message": $(echo "$COMMIT_MESSAGE" | jq -R .),
+          "commit_date": "$COMMIT_DATE_ISO",
+          "workflow_run_id": "$GITHUB_RUN_ID",
+          "pushed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+          "changed_files": $CHANGED_FILES,
+          "diff": $(echo "$DIFFS" | jq -R -s .)
+        }
+        EOF
+
+        echo "Created log file: $LOG_FILE"
+        cat $LOG_FILE
+    - name: Upload to S3
+      run: |
+        aws s3 cp logs/ s3://${{ secrets.S3_BUCKET_NAME }}/github-logs/ --recursive
