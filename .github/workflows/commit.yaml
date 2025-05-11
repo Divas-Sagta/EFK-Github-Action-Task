@@ -33,31 +33,40 @@ jobs:
         COMMIT_DATE=$(git log -1 --pretty=format:'%at' $COMMIT_SHA)
         COMMIT_DATE_ISO=$(date -d @$COMMIT_DATE -u +"%Y-%m-%dT%H:%M:%SZ")
 
-        # Get previous commit SHA
-        PREVIOUS_COMMIT=$(git rev-parse $COMMIT_SHA^)
+        # Get previous commit SHA (safely handle first commits)
+        PREVIOUS_COMMIT=$(git rev-parse $COMMIT_SHA^ 2>/dev/null || git rev-parse --root)
 
-        # Get the list of changed files
-        CHANGED_FILES=$(git diff --name-status $PREVIOUS_COMMIT $COMMIT_SHA | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {status: .[0], file: .[1]}) | .')
+        # Get the list of changed files (safely)
+        CHANGED_FILES=$(git diff --name-status $PREVIOUS_COMMIT $COMMIT_SHA | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | select(length > 1) | {status: .[0], file: .[1]}) | .')
 
-        # Get the actual diff for each file (limited to protect against large diffs)
-        DIFFS=$(git diff --unified=3 $PREVIOUS_COMMIT $COMMIT_SHA | head -n 10000)
+        # Generate the basic JSON structure
+        jq -n \
+          --arg repo "$GITHUB_REPOSITORY" \
+          --arg branch "${GITHUB_REF#refs/heads/}" \
+          --arg sha "$COMMIT_SHA" \
+          --arg author "$AUTHOR_NAME" \
+          --arg email "$AUTHOR_EMAIL" \
+          --arg msg "$COMMIT_MESSAGE" \
+          --arg cdate "$COMMIT_DATE_ISO" \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --arg pushed "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+          --argjson files "$CHANGED_FILES" \
+          '{
+            repository: $repo,
+            branch: $branch,
+            commit_sha: $sha,
+            author_name: $author,
+            author_email: $email,
+            commit_message: $msg,
+            commit_date: $cdate,
+            workflow_run_id: $run_id,
+            pushed_at: $pushed,
+            changed_files: $files
+          }' > $LOG_FILE
 
-        # Generate structured log with additional metadata
-        cat > $LOG_FILE << EOF
-        {
-          "repository": "$GITHUB_REPOSITORY",
-          "branch": "${GITHUB_REF#refs/heads/}",
-          "commit_sha": "$COMMIT_SHA",
-          "author_name": "$AUTHOR_NAME",
-          "author_email": "$AUTHOR_EMAIL",
-          "commit_message": $(echo "$COMMIT_MESSAGE" | jq -R .),
-          "commit_date": "$COMMIT_DATE_ISO",
-          "workflow_run_id": "$GITHUB_RUN_ID",
-          "pushed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-          "changed_files": $CHANGED_FILES,
-          "diff": $(echo "$DIFFS" | jq -R -s .)
-        }
-        EOF
+        # Add the diff separately to avoid escaping issues
+        DIFF_FILE="logs/${REPO_NAME}_diff_${TIMESTAMP}.txt"
+        git diff --unified=3 $PREVIOUS_COMMIT $COMMIT_SHA > $DIFF_FILE
 
         echo "Created log file: $LOG_FILE"
         cat $LOG_FILE
