@@ -1,45 +1,124 @@
+# name: Upload Commit Logs to S3
+# on:
+#   push:
+#     branches: [ main ]
+# permissions:
+#   id-token: write
+#   contents: read
+# jobs:
+#   upload-commit-logs:
+#     runs-on: ubuntu-latest
+#     steps:
+#     - name: Checkout code
+#       uses: actions/checkout@v3
+#       with:
+#         fetch-depth: 0
+#     - name: Configure AWS credentials
+#       uses: aws-actions/configure-aws-credentials@v2
+#       with:
+#         role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+#         aws-region: ${{ secrets.AWS_REGION }}
+#     - name: Generate commit logs
+#       run: |
+#         mkdir -p logs
+#         REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+#         TIMESTAMP=$(date +%Y%m%d%H%M%S)
+#         LOG_FILE="logs/${REPO_NAME}_commits_${TIMESTAMP}.json"
+
+#         # Get latest commit info
+#         COMMIT_SHA=${{ github.sha }}
+#         AUTHOR_NAME=$(git log -1 --pretty=format:'%an' $COMMIT_SHA)
+#         AUTHOR_EMAIL=$(git log -1 --pretty=format:'%ae' $COMMIT_SHA)
+#         COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s' $COMMIT_SHA)
+#         COMMIT_DATE=$(git log -1 --pretty=format:'%at' $COMMIT_SHA)
+#         COMMIT_DATE_ISO=$(date -d @$COMMIT_DATE -u +"%Y-%m-%dT%H:%M:%SZ")
+
+#         # Get previous commit SHA (safely handle first commits)
+#         PREVIOUS_COMMIT=$(git rev-parse $COMMIT_SHA^ 2>/dev/null || git rev-parse --root)
+
+#         # Get the list of changed files (safely)
+#         CHANGED_FILES=$(git diff --name-status $PREVIOUS_COMMIT $COMMIT_SHA | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | select(length > 1) | {status: .[0], file: .[1]}) | .')
+
+#         # Generate the basic JSON structure
+#         jq -n \
+#           --arg repo "$GITHUB_REPOSITORY" \
+#           --arg branch "${GITHUB_REF#refs/heads/}" \
+#           --arg sha "$COMMIT_SHA" \
+#           --arg author "$AUTHOR_NAME" \
+#           --arg email "$AUTHOR_EMAIL" \
+#           --arg msg "$COMMIT_MESSAGE" \
+#           --arg cdate "$COMMIT_DATE_ISO" \
+#           --arg run_id "$GITHUB_RUN_ID" \
+#           --arg pushed "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+#           --argjson files "$CHANGED_FILES" \
+#           '{
+#             repository: $repo,
+#             branch: $branch,
+#             commit_sha: $sha,
+#             author_name: $author,
+#             author_email: $email,
+#             commit_message: $msg,
+#             commit_date: $cdate,
+#             workflow_run_id: $run_id,
+#             pushed_at: $pushed,
+#             changed_files: $files
+#           }' > $LOG_FILE
+
+#         # Add the diff separately to avoid escaping issues
+#         DIFF_FILE="logs/${REPO_NAME}_diff_${TIMESTAMP}.txt"
+#         git diff --unified=3 $PREVIOUS_COMMIT $COMMIT_SHA > $DIFF_FILE
+
+#         echo "Created log file: $LOG_FILE"
+#         cat $LOG_FILE
+#     - name: Upload to S3
+#       run: |
+#         aws s3 cp logs/ s3://${{ secrets.S3_BUCKET_NAME }}/github-logs/ --recursive --content-type "application/json"
+
 name: Upload Commit Logs to S3
+
 on:
   push:
     branches: [ main ]
+
 permissions:
   id-token: write
   contents: read
+
 jobs:
   upload-commit-logs:
     runs-on: ubuntu-latest
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
       with:
         fetch-depth: 0
+
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
         role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
         aws-region: ${{ secrets.AWS_REGION }}
-    - name: Generate commit logs
+
+    - name: Generate and upload commit logs
       run: |
         mkdir -p logs
         REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
         TIMESTAMP=$(date +%Y%m%d%H%M%S)
         LOG_FILE="logs/${REPO_NAME}_commits_${TIMESTAMP}.json"
 
-        # Get latest commit info
         COMMIT_SHA=${{ github.sha }}
         AUTHOR_NAME=$(git log -1 --pretty=format:'%an' $COMMIT_SHA)
         AUTHOR_EMAIL=$(git log -1 --pretty=format:'%ae' $COMMIT_SHA)
         COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s' $COMMIT_SHA)
         COMMIT_DATE=$(git log -1 --pretty=format:'%at' $COMMIT_SHA)
         COMMIT_DATE_ISO=$(date -d @$COMMIT_DATE -u +"%Y-%m-%dT%H:%M:%SZ")
-
-        # Get previous commit SHA (safely handle first commits)
         PREVIOUS_COMMIT=$(git rev-parse $COMMIT_SHA^ 2>/dev/null || git rev-parse --root)
 
-        # Get the list of changed files (safely)
         CHANGED_FILES=$(git diff --name-status $PREVIOUS_COMMIT $COMMIT_SHA | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | select(length > 1) | {status: .[0], file: .[1]}) | .')
 
-        # Generate the basic JSON structure
+        DIFF=$(git diff --unified=3 $PREVIOUS_COMMIT $COMMIT_SHA | jq -R -s .)
+
         jq -n \
           --arg repo "$GITHUB_REPOSITORY" \
           --arg branch "${GITHUB_REF#refs/heads/}" \
@@ -51,6 +130,7 @@ jobs:
           --arg run_id "$GITHUB_RUN_ID" \
           --arg pushed "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
           --argjson files "$CHANGED_FILES" \
+          --arg diff "$DIFF" \
           '{
             repository: $repo,
             branch: $branch,
@@ -61,15 +141,11 @@ jobs:
             commit_date: $cdate,
             workflow_run_id: $run_id,
             pushed_at: $pushed,
-            changed_files: $files
+            changed_files: $files,
+            diff: $diff
           }' > $LOG_FILE
-
-        # Add the diff separately to avoid escaping issues
-        DIFF_FILE="logs/${REPO_NAME}_diff_${TIMESTAMP}.txt"
-        git diff --unified=3 $PREVIOUS_COMMIT $COMMIT_SHA > $DIFF_FILE
 
         echo "Created log file: $LOG_FILE"
         cat $LOG_FILE
-    - name: Upload to S3
-      run: |
-        aws s3 cp logs/ s3://${{ secrets.S3_BUCKET_NAME }}/github-logs/ --recursive --content-type "application/json"
+
+        aws s3 cp $LOG_FILE s3://${{ secrets.S3_BUCKET_NAME }}/github-logs/ --content-type "application/json"
